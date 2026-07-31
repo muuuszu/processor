@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import logging
@@ -171,15 +172,52 @@ class GsApi(object):
             self.sheet_id = spreadsheet_id
         return spreadsheet_id
 
+    blank_write_msg = ('Google rejected the {} contents, so the sheet would '
+                       'have been empty. Nothing was exported.')
+
+    @staticmethod
+    def request_applied(response, context=''):
+        """Whether a Google write actually applied, logging any rejection.
+
+        Google applies a batch atomically, so one bad request can leave
+        the artifact completely empty while the call still returns a
+        usable file id. **Never treat a returned response as success** —
+        that is how a blank Doc shipped with a working URL.
+
+        :param response: the requests response; ``None`` counts as a
+            no-op success so empty batches and test doubles stay valid.
+        :param context: file id / range, for the log line.
+        :returns: whether the write applied.
+        """
+        if response is None:
+            return True
+        status = getattr(response, 'status_code', 200)
+        if status in (200, 204):
+            return True
+        logging.error('Google write rejected ({}) for {}: {}'.format(
+            status, context, str(getattr(response, 'text', ''))[:500]))
+        return False
+
     def write_values(self, spreadsheet_id, range_, values):
         """Write a 2D list of values into the given A1 range. Uses
-        USER_ENTERED so formula-like cells render naturally."""
+        USER_ENTERED so formula-like cells render naturally. Returns the
+        response; a rejection is logged here."""
         url = '{}/{}/values/{}'.format(
             self.sheets_url, spreadsheet_id, range_)
         params = {'valueInputOption': 'USER_ENTERED'}
         body = {'values': values}
         response = self.client.put(url=url, params=params, json=body)
+        self.request_applied(response,
+                             '{}!{}'.format(spreadsheet_id, range_))
         return response
+
+    def write_values_applied(self, spreadsheet_id, range_, values):
+        """:meth:`write_values`, reporting whether Google applied it.
+        Callers that would otherwise hand back a URL to an empty sheet
+        pair this with :attr:`blank_write_msg`."""
+        return self.request_applied(
+            self.write_values(spreadsheet_id, range_, values),
+            spreadsheet_id)
 
     def batch_update(self, spreadsheet_id, requests):
         """POST a list of Sheets requests (repeatCell, mergeCells,
@@ -321,6 +359,15 @@ class GsApi(object):
     DECK_ACCENT = {'red': 0.231, 'green': 0.510, 'blue': 0.965}
     DECK_CARD = {'red': 0.957, 'green': 0.969, 'blue': 0.980}
     DECK_WHITE = {'red': 1.0, 'green': 1.0, 'blue': 1.0}
+    # Hairline for image frames (E0E7EE — the app BRAND_RULE).
+    DECK_RULE = {'red': 0.878, 'green': 0.906, 'blue': 0.933}
+    # Muted text that stays legible on the dark ink cover/dividers.
+    DECK_MUTED_LIGHT = {'red': 0.722, 'green': 0.780, 'blue': 0.839}
+    # Comparator tones (15803D / DC2626 — match the app success/danger).
+    DECK_GOOD = {'red': 0.082, 'green': 0.502, 'blue': 0.239}
+    DECK_BAD = {'red': 0.863, 'green': 0.149, 'blue': 0.149}
+    # Where content starts on a chrome'd slide (below title + accent rule).
+    CONTENT_TOP_EMU = 980000
 
     def _brand_colors(self, brand):
         """Resolve a deck color set from an optional ``brand`` dict (rgbColor
@@ -398,95 +445,213 @@ class GsApi(object):
         ]
 
     def create_title_slide(self, presentation_id, meta, slide_id='rbtitle'):
+        """The dark hero cover (gold-deck convention): full-bleed ink field,
+        white title, one date line, brand-accent foot band, and the brand
+        mark on a white plate so any logo colorway reads on the dark field."""
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
+        colors = self._brand_colors(meta.get('deck_brand'))
         reqs = [self._blank_slide_req(slide_id)]
+        reqs += self._rect_reqs(slide_id, slide_id + 'bg', 0, 0,
+                                self.PAGE_W_EMU, self.PAGE_H_EMU,
+                                colors['ink'])
+        # Brand-accent band anchoring the foot of the cover.
+        band_h = 137160
+        reqs += self._rect_reqs(slide_id, slide_id + 'band', 0,
+                                self.PAGE_H_EMU - band_h, self.PAGE_W_EMU,
+                                band_h, colors['accent'])
         logo_url = meta.get('logo_url')
         if logo_url:
             lw, lh = 1524000, 508000  # 3:1 brand mark, centered near the top
+            pad = 91440  # 0.1" plate padding
+            px = (self.PAGE_W_EMU - lw) // 2 - pad
+            reqs += self._rect_reqs(
+                slide_id, slide_id + 'plate', px, 520000 - pad,
+                lw + 2 * pad, lh + 2 * pad, self.DECK_WHITE,
+                shape_type='ROUND_RECTANGLE')
             reqs.append({'createImage': {
                 'objectId': slide_id + 'logo', 'url': logo_url,
                 'elementProperties': self._elem_props(
                     slide_id, lw, lh, (self.PAGE_W_EMU - lw) // 2, 520000)}})
         reqs += self._text_box_reqs(
             slide_id, slide_id + 't', meta.get('title', ''),
-            cx, 1600200, cw, 900000, font_pt=30, bold=True, align='CENTER')
+            cx, 1600200, cw, 900000, font_pt=30, bold=True, align='CENTER',
+            color=self.DECK_WHITE)
         reqs += self._text_box_reqs(
             slide_id, slide_id + 's', meta.get('subtitle', ''),
             cx, 2600000, cw, 600000, font_pt=16, align='CENTER',
-            color=self.DECK_MUTED)
+            color=self.DECK_MUTED_LIGHT)
         reqs += self._text_box_reqs(
             slide_id, slide_id + 'b', meta.get('brand', ''),
             cx, self.PAGE_H_EMU - 700000, cw, 400000, font_pt=12,
-            align='CENTER', color=self.DECK_MUTED)
+            align='CENTER', color=self.DECK_MUTED_LIGHT)
         self.slides_batch_update(presentation_id, reqs)
         return slide_id
 
     def add_section_slide(self, presentation_id, slide_id, heading,
                           brand=None):
-        """A divider slide: a full-width brand-accent band with the section
-        heading in white centered on it (the gold-deck convention), instead of
-        plain centered text on white."""
+        """A divider slide, gold-deck style: a full-bleed dark ink field with
+        the section heading in white and a short brand-accent underline —
+        richer than a colored band floating on white."""
         colors = self._brand_colors(brand)
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
-        band_h = 1200000
-        band_y = (self.PAGE_H_EMU - band_h) // 2
         reqs = [self._blank_slide_req(slide_id)]
-        reqs += self._rect_reqs(slide_id, slide_id + 'band', 0, band_y,
-                                self.PAGE_W_EMU, band_h, colors['accent'])
+        reqs += self._rect_reqs(slide_id, slide_id + 'bg', 0, 0,
+                                self.PAGE_W_EMU, self.PAGE_H_EMU,
+                                colors['ink'])
+        head_h = 700000
+        head_y = (self.PAGE_H_EMU - head_h) // 2 - 137160
         reqs += self._text_box_reqs(
             slide_id, slide_id + 't', heading or '',
-            cx, band_y + (band_h - 700000) // 2, cw, 700000,
-            font_pt=26, bold=True, align='CENTER', color=self.DECK_WHITE)
+            cx, head_y, cw, head_h,
+            font_pt=28, bold=True, align='CENTER', color=self.DECK_WHITE)
+        rule_w = 2057400  # 2.25" accent underline centered below the heading
+        reqs += self._rect_reqs(
+            slide_id, slide_id + 'rule', (self.PAGE_W_EMU - rule_w) // 2,
+            head_y + head_h + 91440, rule_w, 45720, colors['accent'])
         self.slides_batch_update(presentation_id, reqs)
         return slide_id
 
-    def add_narrative_slide(self, presentation_id, slide_id, title, text):
+    def add_narrative_slide(self, presentation_id, slide_id, title, text,
+                            brand=None, footer=None, page=None, rich=None):
         """A text slide — bold title + narrative body — for the executive
         summary and any analysis not paired with a chart, so the ALI story
-        carries on the deck rather than only in speaker notes."""
+        carries on the deck rather than only in speaker notes.
+
+        ``rich`` (optional) renders the body Slides-native instead of verbatim:
+        ``{'text', 'bold_ranges', 'bullet_ranges'}`` with UTF-16 ``(start,
+        end)`` pairs — markdown bold becomes real bold runs, glyph bullets
+        become native bulleted paragraphs."""
+        colors = self._brand_colors(brand)
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
+        body_id = slide_id + 'b'
+        body_text = (rich or {}).get('text') or text or ''
         reqs = [self._blank_slide_req(slide_id)]
+        reqs += self._content_chrome_reqs(slide_id, title or '', colors,
+                                          footer=footer, page=page)
         reqs += self._text_box_reqs(
-            slide_id, slide_id + 't', title or '', cx, 300000, cw, 560000,
-            font_pt=22, bold=True, align='START')
-        reqs += self._text_box_reqs(
-            slide_id, slide_id + 'b', text or '', cx, 980000, cw,
-            self.PAGE_H_EMU - 980000 - 300000, font_pt=13, align='START')
+            slide_id, body_id, body_text, cx, self.CONTENT_TOP_EMU,
+            cw, self.PAGE_H_EMU - self.CONTENT_TOP_EMU - 420000, font_pt=13,
+            align='START', color=colors['ink'])
+        if body_text:
+            reqs.append({'updateParagraphStyle': {
+                'objectId': body_id,
+                'style': {'lineSpacing': 115,
+                          'spaceBelow': {'magnitude': 4, 'unit': 'PT'}},
+                'textRange': {'type': 'ALL'},
+                'fields': 'lineSpacing,spaceBelow'}})
+        for start, end in (rich or {}).get('bold_ranges') or []:
+            if end > start:
+                reqs.append({'updateTextStyle': {
+                    'objectId': body_id, 'style': {'bold': True},
+                    'textRange': {'type': 'FIXED_RANGE',
+                                  'startIndex': start, 'endIndex': end},
+                    'fields': 'bold'}})
+        for start, end in (rich or {}).get('bullet_ranges') or []:
+            if end > start:
+                reqs.append({'createParagraphBullets': {
+                    'objectId': body_id,
+                    'textRange': {'type': 'FIXED_RANGE',
+                                  'startIndex': start, 'endIndex': end},
+                    'bulletPreset': 'BULLET_DISC_CIRCLE_SQUARE'}})
         self.slides_batch_update(presentation_id, reqs)
         return slide_id
 
     def add_chart_slide(self, presentation_id, slide_id, title=None,
                         image_url=None, caption=None, notes=None,
-                        img_w=None, img_h=None):
+                        img_w=None, img_h=None, brand=None, footer=None,
+                        page=None):
+        colors = self._brand_colors(brand)
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
         reqs = [self._blank_slide_req(slide_id)]
-        if title:
-            reqs += self._text_box_reqs(
-                slide_id, slide_id + 't', title, cx, 228600, cw, 560000,
-                font_pt=18, bold=True, align='START')
+        reqs += self._content_chrome_reqs(slide_id, title, colors,
+                                          footer=footer, page=page)
         if image_url:
-            box_y = 900000
-            box_h = self.PAGE_H_EMU - box_y - (700000 if caption else 300000)
+            box_y = self.CONTENT_TOP_EMU if title else 300000
+            box_h = self.PAGE_H_EMU - box_y - (800000 if caption else 420000)
             x, y, w, h = self._fit_box(img_w, img_h, cx, box_y, cw, box_h)
             reqs.append({'createImage': {
                 'objectId': slide_id + 'i', 'url': image_url,
                 'elementProperties': self._elem_props(slide_id, w, h, x, y)}})
+            # Hairline frame so a white-background chart PNG doesn't float
+            # edgeless on the white slide.
+            reqs.append({'updateImageProperties': {
+                'objectId': slide_id + 'i',
+                'imageProperties': {'outline': {
+                    'outlineFill': {'solidFill': {
+                        'color': {'rgbColor': self.DECK_RULE}}},
+                    'weight': {'magnitude': 1, 'unit': 'PT'}}},
+                'fields': 'outline'}})
         if caption:
             reqs += self._text_box_reqs(
                 slide_id, slide_id + 'c', caption, cx,
-                self.PAGE_H_EMU - 640000, cw, 520000, font_pt=11,
-                align='START', color=self.DECK_MUTED)
+                self.PAGE_H_EMU - 720000, cw, 340000, font_pt=11,
+                align='START', color=colors['muted'])
         self.slides_batch_update(presentation_id, reqs)
         if notes:
             self.add_speaker_notes(presentation_id, slide_id, notes)
         return slide_id
 
-    def _rect_reqs(self, slide_id, shape_id, x, y, w, h, fill_color):
-        """A filled rectangle (no outline) — the card behind a stat tile and
-        the band behind a section heading."""
+    def add_sheets_chart_slide(self, presentation_id, slide_id, title=None,
+                               spreadsheet_id=None, chart_id=None,
+                               caption=None, notes=None, brand=None,
+                               footer=None, page=None,
+                               linking_mode='NOT_LINKED_IMAGE'):
+        """A content slide embedding a native Google Sheets chart.
+
+        Mirrors :meth:`add_chart_slide`'s chrome (title over the accent
+        rule, footer, page number, caption band) but the body is a
+        ``createSheetsChart`` element instead of an image, so the deck
+        needs no rasterized pixels at all. Slides renders the chart into
+        the element box, so the box fills the content area directly (no
+        aspect-fit math).
+
+        :param presentation_id: the deck to add the slide to.
+        :param slide_id: the new slide's object id.
+        :param title: slide title for the content chrome.
+        :param spreadsheet_id: the spreadsheet holding the chart.
+        :param chart_id: the chart's id from the ``addChart`` reply.
+        :param caption: one-line takeaway under the chart.
+        :param notes: speaker-notes text.
+        :param brand: optional per-client deck colors (rgbColor dict).
+        :param footer: muted running footer text.
+        :param page: slide number for the footer chrome.
+        :param linking_mode: ``NOT_LINKED_IMAGE`` (default) renders a
+            static Google-rendered chart image so the source spreadsheet
+            can stay private; ``LINKED`` keeps a live link and requires
+            viewers to have access to the spreadsheet.
+        :returns: ``slide_id``.
+        """
+        colors = self._brand_colors(brand)
+        cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
+        reqs = [self._blank_slide_req(slide_id)]
+        reqs += self._content_chrome_reqs(slide_id, title, colors,
+                                          footer=footer, page=page)
+        box_y = self.CONTENT_TOP_EMU if title else 300000
+        box_h = self.PAGE_H_EMU - box_y - (800000 if caption else 420000)
+        reqs.append({'createSheetsChart': {
+            'objectId': slide_id + 'i',
+            'spreadsheetId': spreadsheet_id,
+            'chartId': chart_id,
+            'linkingMode': linking_mode,
+            'elementProperties': self._elem_props(
+                slide_id, cw, box_h, cx, box_y)}})
+        if caption:
+            reqs += self._text_box_reqs(
+                slide_id, slide_id + 'c', caption, cx,
+                self.PAGE_H_EMU - 720000, cw, 340000, font_pt=11,
+                align='START', color=colors['muted'])
+        self.slides_batch_update(presentation_id, reqs)
+        if notes:
+            self.add_speaker_notes(presentation_id, slide_id, notes)
+        return slide_id
+
+    def _rect_reqs(self, slide_id, shape_id, x, y, w, h, fill_color,
+                   shape_type='RECTANGLE'):
+        """A filled shape (no outline) — the card behind a stat tile, the
+        band behind a section heading, the ink field behind a cover."""
         return [
             {'createShape': {
-                'objectId': shape_id, 'shapeType': 'RECTANGLE',
+                'objectId': shape_id, 'shapeType': shape_type,
                 'elementProperties': self._elem_props(slide_id, w, h, x, y)}},
             {'updateShapeProperties': {
                 'objectId': shape_id,
@@ -498,8 +663,35 @@ class GsApi(object):
                            'outline.propertyState')}},
         ]
 
+    def _content_chrome_reqs(self, slide_id, title, colors, footer=None,
+                             page=None):
+        """Shared chrome for content slides — bold title over a thin
+        brand-accent rule, plus a muted footer line and slide number — so
+        every slide reads as part of one branded deck rather than floating
+        text on white. Content starts at ``CONTENT_TOP_EMU``."""
+        cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
+        reqs = []
+        if title:
+            reqs += self._text_box_reqs(
+                slide_id, slide_id + 't', title, cx, 228600, cw, 520000,
+                font_pt=20, bold=True, align='START', color=colors['ink'])
+            reqs += self._rect_reqs(slide_id, slide_id + 'rule', cx, 800100,
+                                    cw, 22860, colors['accent'])
+        if footer:
+            reqs += self._text_box_reqs(
+                slide_id, slide_id + 'f', footer, cx,
+                self.PAGE_H_EMU - 320000, cw - 700000, 260000, font_pt=9,
+                align='START', color=colors['muted'])
+        if page:
+            reqs += self._text_box_reqs(
+                slide_id, slide_id + 'pg', str(page),
+                self.PAGE_W_EMU - self.MARGIN_EMU - 600000,
+                self.PAGE_H_EMU - 320000, 600000, 260000, font_pt=9,
+                align='END', color=colors['muted'])
+        return reqs
+
     def add_stat_tile_slide(self, presentation_id, slide_id, title, tiles,
-                            brand=None):
+                            brand=None, footer=None, page=None):
         """A slide of native stat tiles — each a card with a hero number, a
         label, and a one-line comparison caption — built from Slides shapes so
         the export never screenshots a KPI chart. ``tiles`` = list of
@@ -507,25 +699,27 @@ class GsApi(object):
         colors = self._brand_colors(brand)
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
         reqs = [self._blank_slide_req(slide_id)]
-        if title:
-            reqs += self._text_box_reqs(
-                slide_id, slide_id + 't', title, cx, 228600, cw, 520000,
-                font_pt=20, bold=True, align='START')
+        reqs += self._content_chrome_reqs(slide_id, title, colors,
+                                          footer=footer, page=page)
         tiles = list(tiles or [])[:8]
         if tiles:
             cols = 4 if len(tiles) > 3 else len(tiles)
             n_rows = (len(tiles) + cols - 1) // cols
             gap = 137160  # 0.15"
-            grid_y = 900000
-            grid_h = self.PAGE_H_EMU - grid_y - self.MARGIN_EMU
+            grid_y = self.CONTENT_TOP_EMU
+            grid_h = self.PAGE_H_EMU - grid_y - 420000
             cell_w = (cw - gap * (cols - 1)) // cols
             cell_h = (grid_h - gap * (n_rows - 1)) // n_rows
+            cell_h = min(cell_h, 1370000)  # ~1.5"
             pad = 100000
             for i, tile in enumerate(tiles):
                 r, c = divmod(i, cols)
                 x = cx + c * (cell_w + gap)
                 y = grid_y + r * (cell_h + gap)
                 base = '{}c{}'.format(slide_id, i)
+                cap_color = {'good': self.DECK_GOOD,
+                             'bad': self.DECK_BAD}.get(
+                    tile.get('tone'), colors['muted'])
                 reqs += self._rect_reqs(slide_id, base + 'r', x, y,
                                         cell_w, cell_h, colors['card'])
                 reqs += self._text_box_reqs(
@@ -543,15 +737,22 @@ class GsApi(object):
                         slide_id, base + 'p', str(tile['caption']),
                         x + pad, y + cell_h * 71 // 100, cell_w - 2 * pad,
                         cell_h * 26 // 100, font_pt=9, align='START',
-                        color=colors['muted'])
+                        color=cap_color)
         self.slides_batch_update(presentation_id, reqs)
         return slide_id
+
+    # A display value that reads as a number/rate — right-aligned in native
+    # tables ("$1,234.50", "1.2B", "0.15%", "3.4x", "120% of plan").
+    _NUMERIC_CELL_RE = re.compile(
+        r'^[-+(]?[$€£]?\s?\d[\d,.]*\s*(?:[KMB%]|x)?\)?'
+        r'(?:\s+of plan)?$', re.IGNORECASE)
 
     def _table_reqs(self, slide_id, table_id, x, y, w, h, header, body_rows,
                     colors):
         """Requests for a native table with a filled, white-on-accent header
-        row. Empty cells are left unstyled (Slides rejects an ALL text range on
-        an empty cell)."""
+        row, zebra-banded body rows, and right-aligned numeric cells. Empty
+        cells are left unstyled (Slides rejects an ALL text range on an empty
+        cell)."""
         all_rows = [list(header)] + [list(r) for r in body_rows]
         n_cols = len(header)
         reqs = [{'createTable': {
@@ -578,6 +779,12 @@ class GsApi(object):
                             self.DECK_WHITE if is_header else colors['ink'])}}},
                     'textRange': {'type': 'ALL'},
                     'fields': 'fontSize,bold,fontFamily,foregroundColor'}})
+                if not is_header and self._NUMERIC_CELL_RE.match(val):
+                    reqs.append({'updateParagraphStyle': {
+                        'objectId': table_id, 'cellLocation': loc,
+                        'style': {'alignment': 'END'},
+                        'textRange': {'type': 'ALL'},
+                        'fields': 'alignment'}})
         reqs.append({'updateTableCellProperties': {
             'objectId': table_id,
             'tableRange': {'location': {'rowIndex': 0, 'columnIndex': 0},
@@ -585,10 +792,21 @@ class GsApi(object):
             'tableCellProperties': {'tableCellBackgroundFill': {
                 'solidFill': {'color': {'rgbColor': colors['accent']}}}},
             'fields': 'tableCellBackgroundFill.solidFill.color'}})
+        # Zebra banding on alternating body rows keeps a 12-row scorecard
+        # scannable without heavy gridlines.
+        for r in range(2, len(all_rows), 2):
+            reqs.append({'updateTableCellProperties': {
+                'objectId': table_id,
+                'tableRange': {'location': {'rowIndex': r, 'columnIndex': 0},
+                               'rowSpan': 1, 'columnSpan': n_cols},
+                'tableCellProperties': {'tableCellBackgroundFill': {
+                    'solidFill': {'color': {'rgbColor': colors['card']}}}},
+                'fields': 'tableCellBackgroundFill.solidFill.color'}})
         return reqs
 
     def add_table_slide(self, presentation_id, slide_id, title, header,
-                        body_rows, brand=None, caption=None):
+                        body_rows, brand=None, caption=None, footer=None,
+                        page=None):
         """A slide with a native Slides table (styled header) — the KPI
         scorecard and any tabular/appendix panel, built native rather than
         screenshotted. ``caption`` reads under the table like a chart
@@ -596,37 +814,35 @@ class GsApi(object):
         colors = self._brand_colors(brand)
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
         reqs = [self._blank_slide_req(slide_id)]
-        if title:
-            reqs += self._text_box_reqs(
-                slide_id, slide_id + 't', title, cx, 228600, cw, 520000,
-                font_pt=20, bold=True, align='START')
-        ty = 900000
-        th = self.PAGE_H_EMU - ty - (700000 if caption else self.MARGIN_EMU)
+        reqs += self._content_chrome_reqs(slide_id, title, colors,
+                                          footer=footer, page=page)
+        ty = self.CONTENT_TOP_EMU
+        th = self.PAGE_H_EMU - ty - (800000 if caption else 420000)
         reqs += self._table_reqs(slide_id, slide_id + 'tbl', cx, ty, cw, th,
                                  header, body_rows, colors)
         if caption:
             reqs += self._text_box_reqs(
                 slide_id, slide_id + 'c', caption, cx,
-                self.PAGE_H_EMU - 640000, cw, 520000, font_pt=11,
+                self.PAGE_H_EMU - 720000, cw, 340000, font_pt=11,
                 align='START', color=colors['muted'])
         self.slides_batch_update(presentation_id, reqs)
         return slide_id
 
-    def add_toc_slide(self, presentation_id, slide_id, entries, brand=None):
+    def add_toc_slide(self, presentation_id, slide_id, entries, brand=None,
+                      footer=None, page=None):
         """A table-of-contents slide: numbered section labels (gold-deck
         convention). ``entries`` is a list of section-label strings."""
         colors = self._brand_colors(brand)
         cx, cw = self.MARGIN_EMU, self.PAGE_W_EMU - 2 * self.MARGIN_EMU
         reqs = [self._blank_slide_req(slide_id)]
-        reqs += self._text_box_reqs(
-            slide_id, slide_id + 't', 'Contents', cx, 300000, cw, 560000,
-            font_pt=22, bold=True, align='START')
+        reqs += self._content_chrome_reqs(slide_id, 'Contents', colors,
+                                          footer=footer, page=page)
         body = '\n'.join('{}.  {}'.format(i + 1, e)
                          for i, e in enumerate(entries or []))
         reqs += self._text_box_reqs(
-            slide_id, slide_id + 'b', body, cx, 980000, cw,
-            self.PAGE_H_EMU - 980000 - 300000, font_pt=14, align='START',
-            color=colors['ink'])
+            slide_id, slide_id + 'b', body, cx, self.CONTENT_TOP_EMU, cw,
+            self.PAGE_H_EMU - self.CONTENT_TOP_EMU - 420000, font_pt=14,
+            align='START', color=colors['ink'])
         self.slides_batch_update(presentation_id, reqs)
         return slide_id
 
@@ -758,49 +974,128 @@ class GsApi(object):
         }
         return format_req
 
+    null_cell_text = ('none', 'nan', 'nat', 'null')
+
+    @staticmethod
+    def utf16_len(text):
+        """Length of ``text`` in UTF-16 code units — the unit every Docs
+        API index counts. Python ``len`` undercounts astral chars
+        (emoji), shifting every later range in the batch."""
+        return len(text.encode('utf-16-le')) // 2
+
+    @staticmethod
+    def cell_text(cell):
+        """One table cell as document text — missing values read blank
+        rather than as the literal 'None'/'nan' a client must never see
+        in a report."""
+        try:
+            blank = cell is None or bool(pd.isna(cell))
+        except (TypeError, ValueError):  # arrays/lists aren't null-testable
+            blank = False
+        if blank:
+            return ''
+        text = str(cell).strip()
+        return '' if text.lower() in GsApi.null_cell_text else text
+
     @staticmethod
     def fill_row(row, index):
-        row_requests = []
-        for cell in row:
-            if not str(cell).strip():
-                cell = '0'
-            row_requests.append({
-                "insertText":
-                    {
-                        "text": str(cell).strip(),
-                        "location":
-                            {
-                                "index": index
-                            }
-                    }
-            })
-            index += len(str(cell).strip()) + 2
-        index += 1
-        return row_requests, index
+        """Insert requests for one table row's cells, walking the index
+        forward cell by cell; returns ``(requests, index, ranges)`` where
+        ``ranges`` are the non-empty cells' text spans (for styling).
 
-    def add_table(self, data, index):
+        A blank cell inserts nothing — the Docs API rejects empty text —
+        but still advances the index by its structural width (cell start
+        + paragraph newline), so the walk stays aligned with the table.
         """
+        row_requests = []
+        ranges = []
+        for cell in row:
+            text = GsApi.cell_text(cell)
+            if text:
+                row_requests.append({
+                    "insertText":
+                        {
+                            "text": text,
+                            "location":
+                                {
+                                    "index": index
+                                }
+                        }
+                })
+                ranges.append((index, index + GsApi.utf16_len(text)))
+            index += GsApi.utf16_len(text) + 2
+        index += 1
+        return row_requests, index, ranges
+
+    @staticmethod
+    def _table_header_style_reqs(table_start, ncols, header_ranges, style):
+        """Style requests for a Docs table's header row — a brand fill
+        behind row 0 plus bold contrast text — so an exported table reads
+        as a designed artifact rather than a raw grid.
+
+        :param table_start: the table element's start index.
+        :param ncols: header cell count.
+        :param header_ranges: the header cells' text ranges.
+        :param style: ``{'header_bg': rgb01, 'header_fg': rgb01}``.
+        :returns: the style request list.
+        """
+        reqs = [{'updateTableCellStyle': {
+            'tableCellStyle': {'backgroundColor': {'color': {
+                'rgbColor': style['header_bg']}}},
+            'fields': 'backgroundColor',
+            'tableRange': {
+                'tableCellLocation': {
+                    'tableStartLocation': {'index': table_start},
+                    'rowIndex': 0, 'columnIndex': 0},
+                'rowSpan': 1, 'columnSpan': ncols}}}]
+        for start, end in header_ranges:
+            reqs.append({'updateTextStyle': {
+                'range': {'startIndex': start, 'endIndex': end},
+                'textStyle': {'bold': True, 'foregroundColor': {'color': {
+                    'rgbColor': style['header_fg']}}},
+                'fields': 'bold,foregroundColor'}})
+        return reqs
+
+    def add_table(self, data, index, style=None):
+        """Requests rendering ``data`` (a list of row dicts) as a native
+        Docs table, plus the index one past it.
+
+        Returns ``([], index)`` for an empty table — a columned frame with
+        no rows is common in a generated report and must not abort the
+        whole document.
+
+        :param style: optional ``{'header_bg', 'header_fg'}`` rgb01 pair;
+            when given the header row gets a brand fill + bold contrast
+            text.
+
         See for indexing: (https://stackoverflow.com/questions/75689738/
         how-can-i-dynamically-populate-a-table-in-google-doc-using-their-api)
         """
         if not data:
-            return index
+            return [], index
         start_ind = index
+        ncols = len(data[0])
         table_requests = [{'insertTable': {
             'rows': len(data) + 1,
-            'columns': len(data[0]),
+            'columns': ncols,
             'endOfSegmentLocation': {
                 'segmentId': ''
             }
         }}]
         index += 4
-        column_req, index = self.fill_row(data[0].keys(), index)
-        table_requests.append(column_req)
+        column_req, index, header_ranges = self.fill_row(data[0].keys(),
+                                                         index)
+        table_requests += column_req
         for row in data:
-            row_request, index = self.fill_row(row.values(), index)
+            row_request, index, _ = self.fill_row(row.values(), index)
             table_requests += row_request
         table_requests.append(self.get_format_req(start_ind, index - 1,
                                                   self.text_format))
+        if style:
+            # The table element itself starts one past the insertion
+            # point (the API inserts a leading newline first).
+            table_requests += self._table_header_style_reqs(
+                start_ind + 1, ncols, header_ranges, style)
         return table_requests, index - 1
 
     def add_image_doc(self, presigned_url, index, width_pt=250,
@@ -843,18 +1138,142 @@ class GsApi(object):
         url = self.files_url + '/{}'.format(file_id)
         self.client.delete(url)
 
-    def add_text(self, doc_id, text_json=None, index=1, newline=True):
-        logging.info('Adding text to doc.')
-        url = self.docs_url + "/" + doc_id + ":batchUpdate"
-        headers = {"Content-Type": "application/json"}
+    @staticmethod
+    def image_size_pt(item):
+        """``(width_pt, height_pt)`` for an item's inline chart image —
+        the item's explicit size when it carries one, else page width
+        scaled to the captured PNG's aspect ratio."""
+        w_pt, h_pt = item.get('img_pt_w'), item.get('img_pt_h')
+        if w_pt and h_pt:
+            return w_pt, h_pt
+        img_w, img_h = item.get('img_w'), item.get('img_h')
+        if not (img_w and img_h):
+            return 320, 200
+        w_pt = 468  # US-Letter content width (8.5" - 1" of margins)
+        return w_pt, max(120, min(600, int(round(w_pt * img_h / img_w))))
+
+    def add_media_requests(self, item, index, table_style=None):
+        """``(requests, index)`` for an item's trailing media — an inline
+        chart image or a native table.
+
+        Every key here is optional: report payloads arrive from several
+        eras and generators, and a missing url / cols / rows must cost
+        that one item its media, never the whole document. ``cols``
+        carries plain column names from a client capture and column
+        dicts from a server-built table, so only the former can name an
+        image.
+
+        :param table_style: brand header colors threaded to
+            :meth:`add_table`, if any.
+        """
+        data = item.get('data') or {}
+        cols = data.get('cols') or []
+        if not cols:
+            return [], index
+        if 'imgURI' in cols:
+            w_pt, h_pt = self.image_size_pt(item)
+            return self.add_image_doc(item.get('url'), index, w_pt, h_pt)
+        return self.add_table(data.get('data'), index=index,
+                              style=table_style)
+
+    def get_document(self, doc_id):
+        """The Docs document resource, for read-back verification."""
+        return self.client.get('{}/{}'.format(self.docs_url, doc_id)).json()
+
+    def document_is_empty(self, doc_id):
+        """Whether the document has no content at all — the state a
+        rejected batchUpdate leaves behind.
+
+        A newly created doc holds one empty paragraph, so any real text,
+        table or inline image proves the body landed. Read-back is the
+        one check that catches a blank export regardless of *which*
+        request Google refused.
+        """
+        doc = self.get_document(doc_id)
+        if doc.get('inlineObjects'):
+            return False
+        for el in doc.get(self.body_str, {}).get(self.cont_str, []):
+            if el.get('table'):
+                return False
+            for run in el.get(self.para_str, {}).get('elements', []):
+                if run.get('textRun', {}).get(self.cont_str, '').strip():
+                    return False
+        return True
+
+    @staticmethod
+    def _item_text_style_reqs(item, start, end):
+        """Style requests for one item's inserted text — paragraph
+        alignment, a text color, italics — from the optional item keys
+        the report exporter stamps (``alignment`` / ``text_color`` /
+        ``italic``). Empty when the item carries none."""
+        reqs = []
+        if item.get('alignment'):
+            reqs.append({'updateParagraphStyle': {
+                'range': {'startIndex': start, 'endIndex': end},
+                'paragraphStyle': {'alignment': item['alignment']},
+                'fields': 'alignment'}})
+        style, fields = {}, []
+        if item.get('text_color'):
+            style['foregroundColor'] = {'color': {
+                'rgbColor': item['text_color']}}
+            fields.append('foregroundColor')
+        if item.get('italic'):
+            style['italic'] = True
+            fields.append('italic')
+        if style and end > start:
+            reqs.append({'updateTextStyle': {
+                'range': {'startIndex': start, 'endIndex': end},
+                'textStyle': style, 'fields': ','.join(fields)}})
+        return reqs
+
+    @staticmethod
+    def _rich_text_reqs(rich, start):
+        """Style requests realizing a ``narrative_rich`` payload at its
+        inserted position: markdown bold becomes real bold runs, glyph
+        bullets become native Docs bulleted paragraphs. Ranges are
+        UTF-16 offsets into the rich text, matching Docs indexing."""
+        reqs = []
+        for s, e in rich.get('bold_ranges') or []:
+            reqs.append({'updateTextStyle': {
+                'range': {'startIndex': start + s, 'endIndex': start + e},
+                'textStyle': {'bold': True}, 'fields': 'bold'}})
+        for s, e in rich.get('bullet_ranges') or []:
+            reqs.append({'createParagraphBullets': {
+                'range': {'startIndex': start + s, 'endIndex': start + e},
+                'bulletPreset': 'BULLET_DISC_CIRCLE_SQUARE'}})
+        return reqs
+
+    def doc_body_requests(self, text_json, index=1, newline=True,
+                          text_only=False, table_style=None):
+        """Build the batchUpdate requests for a report body.
+
+        The pure half of :meth:`add_text` (kept separate so tests can
+        assert request shapes without a network). Items may carry, on
+        top of ``message``/``format``/``data``: ``page_break`` (start a
+        new page before the item), ``rich`` (a ``narrative_rich``
+        payload — real bold + native bullets), ``alignment``,
+        ``text_color`` and ``italic``. All styling degrades away under
+        ``text_only`` — the salvage retry stays maximally plain.
+
+        :param text_json: the report items.
+        :param index: document index to start writing at.
+        :param newline: end every item's text with a newline.
+        :param text_only: plain text only — no media, no styling.
+        :param table_style: brand header colors for native tables.
+        :returns: the request list.
+        """
         request = []
         format_request = []
         for item in text_json:
-            if item['selected'] == 'false':
+            if item.get('selected') == 'false' or 'message' not in item:
                 continue
-            if 'message' not in item:
-                continue
-            text = item['message']
+            rich = None if text_only else item.get('rich')
+            if item.get('page_break') and not text_only:
+                request.append({'insertPageBreak': {
+                    'location': {'index': index}}})
+                index += 2
+            text = rich['text'] if rich and rich.get('text') \
+                else item['message']
             if newline:
                 text += '\n'
             request.append({
@@ -865,29 +1284,43 @@ class GsApi(object):
                     'text': text
                 }
             })
-            style = item['format'] if 'format' in item else self.text_format
-            end_ind = index + len(text) - 1
+            style = item.get('format') or self.text_format
+            end_ind = index + self.utf16_len(text) - 1
             format_request.append(self.get_format_req(index, end_ind, style))
-            index += len(text)
-            if 'data' in item:
-                table_req = []
-                if 'imgURI' in item['data']['cols']:
-                    presigned_url = item['url']
-                    w_pt, h_pt = item.get('img_pt_w'), item.get('img_pt_h')
-                    if not (w_pt and h_pt):
-                        w_pt, h_pt = 320, 200
-                        iw, ih = item.get('img_w'), item.get('img_h')
-                        if iw and ih:  # size charts to page width by aspect
-                            w_pt = 468  # US-Letter content width (8.5"-1")
-                            h_pt = max(120, min(600,
-                                                int(round(w_pt * ih / iw))))
-                    table_req, index = self.add_image_doc(
-                        presigned_url, index, w_pt, h_pt)
-                elif item['data']['cols']:
-                    table_req, index = self.add_table(item['data']['data'],
-                                                      index=index)
-                request += table_req
-        request += format_request
+            if not text_only:
+                format_request += self._item_text_style_reqs(
+                    item, index, end_ind)
+                if rich:
+                    format_request += self._rich_text_reqs(rich, index)
+            index += self.utf16_len(text)
+            if not text_only:
+                media_req, index = self.add_media_requests(
+                    item, index, table_style=table_style)
+                request += media_req
+        return request + format_request
+
+    def add_text(self, doc_id, text_json=None, index=1, newline=True,
+                 text_only=False, table_style=None):
+        """Write a report body into a Google Doc in one batchUpdate.
+
+        :param doc_id: the target document.
+        :param text_json: the report items (headings, text, tables,
+            chart images), plus the optional styling keys
+            :meth:`doc_body_requests` reads.
+        :param index: document index to start writing at.
+        :param newline: end every item's text with a newline.
+        :param text_only: skip images, tables and styling — the degraded
+            retry used when the full body is rejected, so a client still
+            gets the narrative rather than a blank document.
+        :param table_style: brand header colors for native tables.
+        :returns: ``(response, body)``.
+        """
+        logging.info('Adding text to doc.')
+        url = self.docs_url + "/" + doc_id + ":batchUpdate"
+        headers = {"Content-Type": "application/json"}
+        request = self.doc_body_requests(
+            text_json, index=index, newline=newline, text_only=text_only,
+            table_style=table_style)
         body = {"requests": request}
         response = self.client.post(url=url, json=body, headers=headers)
         return response, body

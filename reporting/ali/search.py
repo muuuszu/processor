@@ -18,6 +18,7 @@ Returns {model_id: {'combined': float, 'live': float,
                      'bm25': float, 'tfidf': float}}.
 """
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class AliSearch:
     TF-IDF/BM25 scoring from the existing TfIdfTransformer."""
 
     def __init__(self, ali_chat, transformer=None,
-                 transformer_dict=None):
+                 transformer_dict=None, stats=None):
         """
         :param ali_chat: AliChat instance (provides find_db_model,
             remove_stop_words_from_message,
@@ -51,29 +52,65 @@ class AliSearch:
             loaded from TransformerModel on the app side)
         :param transformer_dict: Dict mapping doc index to
             {model, id, text} metadata
+        :param stats: Optional dict the search accumulates timing and
+            hit counters into, so the caller can persist where a
+            retrieval pass actually spent its time. ``None`` (the
+            default) disables accounting entirely — the counters are
+            for the app's telemetry, not for search itself.
         """
         self.ali_chat = ali_chat
         self.transformer = transformer
         self.transformer_dict = transformer_dict or {}
+        self.stats = stats
 
-    def search(self, db_model, message, top_k=5):
+    def _bump(self, key, value):
+        """Add ``value`` to a counter in the optional stats sink.
+
+        :param key: counter name.
+        :param value: amount to add.
+        :returns: None
+        """
+        if self.stats is None:
+            return
+        self.stats[key] = round(self.stats.get(key, 0) + value, 2)
+
+    def search(self, db_model, message, top_k=5, components=None):
         """Combined search returning {model_id: scores} dict.
 
-        Runs live keyword search (always) and transformer search
-        (when transformer is provided). Merges and re-ranks.
+        Runs live keyword search and transformer search (when the
+        transformer is provided). Merges and re-ranks.
 
         :param db_model: SQLAlchemy model class to search
         :param message: User query string
         :param top_k: Max results to return
+        :param components: Optional iterable subset of
+            ``{'live', 'bm25', 'tfidf'}`` restricting which score
+            sources run. ``None`` (default) runs everything — the
+            app layer's runtime toggles pass an explicit subset.
         :returns: Dict of {model_id: score_dict} where score_dict
             has keys combined, live, bm25, tfidf
         """
+        enabled = (set(components) if components is not None
+                   else {'live', 'bm25', 'tfidf'})
         results = {}
-        self._live_search(results, db_model, message)
+        self._bump('models_searched', 1)
+        if 'live' in enabled:
+            t0 = time.perf_counter()
+            self._live_search(results, db_model, message)
+            self._bump('live_ms',
+                       (time.perf_counter() - t0) * 1000)
+            self._bump('live_hits', len(results))
         if (self.transformer is not None
-                and self.transformer_dict):
+                and self.transformer_dict
+                and enabled & {'bm25', 'tfidf'}):
+            before = len(results)
+            t0 = time.perf_counter()
             self._transformer_search(
-                results, db_model, message, top_k)
+                results, db_model, message, top_k,
+                enabled=enabled)
+            self._bump('transformer_ms',
+                       (time.perf_counter() - t0) * 1000)
+            self._bump('transformer_hits', len(results) - before)
         if len(results) > top_k:
             sorted_items = sorted(
                 results.items(),
@@ -103,7 +140,7 @@ class AliSearch:
                     db_model.__name__, e))
 
     def _transformer_search(self, results, db_model,
-                            message, top_k):
+                            message, top_k, enabled=None):
         """Run BM25 + TF-IDF cosine from the transformer.
 
         Each model gets its OWN top slice of the corpus scores.
@@ -112,18 +149,26 @@ class AliSearch:
         dominate the corpus — Notes is a large share of the
         trained docs, so other models' bm25/tfidf almost never
         survived the filter and the scores went unused.
+
+        :param enabled: Optional set restricting which of the two
+            transformer scores merge (``'bm25'`` / ``'tfidf'``).
         """
         try:
+            enabled = enabled or {'bm25', 'tfidf'}
             model_name = db_model.__name__
             by_model = self._scores_by_model(message)
-            _merge_transformer_scores(
-                results, by_model['bm25'].get(model_name, [])[:top_k * 2],
-                self.transformer_dict, model_name,
-                weight=WEIGHT_BM25, score_key='bm25')
-            _merge_transformer_scores(
-                results, by_model['tfidf'].get(model_name, [])[:top_k * 2],
-                self.transformer_dict, model_name,
-                weight=WEIGHT_TFIDF, score_key='tfidf')
+            if 'bm25' in enabled:
+                _merge_transformer_scores(
+                    results,
+                    by_model['bm25'].get(model_name, [])[:top_k * 2],
+                    self.transformer_dict, model_name,
+                    weight=WEIGHT_BM25, score_key='bm25')
+            if 'tfidf' in enabled:
+                _merge_transformer_scores(
+                    results,
+                    by_model['tfidf'].get(model_name, [])[:top_k * 2],
+                    self.transformer_dict, model_name,
+                    weight=WEIGHT_TFIDF, score_key='tfidf')
         except Exception as e:
             logger.warning(
                 'Transformer search failed: {}'.format(e))
@@ -143,9 +188,15 @@ class AliSearch:
             setattr(self.ali_chat, 'transformer_score_cache', cache)
         if message not in cache:
             n_docs = len(self.transformer_dict)
-            cache[message] = (
-                self.transformer.bm25_search(message, top_k=n_docs),
-                self.transformer.search(message, top_k=n_docs))
+            self._bump('corpus_docs', n_docs)
+            t0 = time.perf_counter()
+            bm25 = self.transformer.bm25_search(message, top_k=n_docs)
+            t1 = time.perf_counter()
+            tfidf = self.transformer.search(message, top_k=n_docs)
+            t2 = time.perf_counter()
+            self._bump('bm25_scan_ms', (t1 - t0) * 1000)
+            self._bump('tfidf_scan_ms', (t2 - t1) * 1000)
+            cache[message] = (bm25, tfidf)
         return cache[message]
 
     def _scores_by_model(self, message):
@@ -162,6 +213,7 @@ class AliSearch:
         cache = getattr(self.ali_chat, 'transformer_score_cache')
         cache_key = (message, 'by_model')
         if cache_key not in cache:
+            group_start = time.perf_counter()
             grouped = {'bm25': {}, 'tfidf': {}}
             for key, full in (('bm25', bm25_full),
                               ('tfidf', tfidf_full)):
@@ -174,6 +226,8 @@ class AliSearch:
                     model_name = doc_info.get('model')
                     grouped[key].setdefault(
                         model_name, []).append((doc_idx, score))
+            self._bump('group_ms',
+                       (time.perf_counter() - group_start) * 1000)
             cache[cache_key] = grouped
         return cache[cache_key]
 

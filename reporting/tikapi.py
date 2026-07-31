@@ -50,7 +50,19 @@ class TikApi(object):
                'checkout': 'checkout',
                'view_content': 'view_content',
                'engagements': 'Clicks (all)',
-               'offline_shopping_events': 'offline_shopping_events'}
+               'offline_add_to_cart_events': 'Adds to cart (offline)',
+               'offline_add_to_wishlist_events': 'Adds to wishlist (offline)',
+               'offline_initiate_checkout_events': 'Checkouts initiated (offline)',
+               'offline_contact_events': 'Contacts (offline)',
+               'offline_view_content_events': 'Content views (offline)',
+               'offline_download_events': 'Downloads (offline)',
+               'offline_form_events': 'Form submissions (offline)',
+               'offline_place_order_events': 'Orders placed (offline)',
+               'offline_add_payment_info_events': 'Payment info adds (offline)',
+               'offline_shopping_events': 'Purchases (offline)',
+               'offline_complete_registration_events': 'Registrations (offline)',
+               'offline_total_schedule': 'Schedules (offline)',
+               'offline_subscribe_events': 'Subscriptions (offline)'}
     default_config_file_name = 'tikapi.json'
 
     def __init__(self):
@@ -399,6 +411,12 @@ class TikApi(object):
             return results
         df = pd.DataFrame(data=self.campaign_id_list)
         df = self.filter_df_on_campaign(df)
+        if 'campaign_name' not in df.columns:
+            msg = ' '.join([failure_msg, 'No Campaigns Under Advertiser. '
+                                         'Check Active and Permissions.'])
+            row = [camp_col, msg, False]
+            results.append(row)
+            return results
         campaign_names = df['campaign_name'].to_list()
         msg = ' '.join(
             [success_msg, 'CAMPAIGNS INCLUDED IF DATA PAST START DATE:'])
