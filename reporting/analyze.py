@@ -2499,18 +2499,14 @@ class CheckFlatSpends(AnalyzeBase):
                 old_val = aly_dict[dctc.PD].replace('00:00:00', '').strip()
                 new_val = aly_dict[
                     self.first_click_col].replace('00:00:00', '').strip()
-                try:
-                    trans = [[dctc.PD, old_val, new_val,
-                              'Select::' + dctc.PN,
-                              aly_dict[dctc.PN]]]
-                    row = pd.DataFrame(trans, columns=translation_df.columns)
-                    tdf = pd.concat([tdf, row], ignore_index=True)
-                except ValueError:
-                    trans = [[dctc.PD, old_val, new_val,
-                              'Select::' + dctc.PN,
-                              aly_dict[dctc.PN], 0]]
-                    row = pd.DataFrame(trans, columns=translation_df.columns)
-                    tdf = pd.concat([tdf, row], ignore_index=True)
+                trans = [{dctc.DICT_COL_NAME: dctc.PD,
+                          dctc.DICT_COL_VALUE: old_val,
+                          dctc.DICT_COL_NVALUE: new_val,
+                          dctc.DICT_COL_FNC: 'Select::' + dctc.PN,
+                          dctc.DICT_COL_SEL: aly_dict[dctc.PN]}]
+                row = pd.DataFrame(trans).reindex(
+                    columns=translation_df.columns).fillna('')
+                tdf = pd.concat([tdf, row], ignore_index=True)
         translation_df = pd.concat([translation_df, tdf], ignore_index=True)
         if write:
             translation.write(translation_df, dctc.filename_tran_config)
