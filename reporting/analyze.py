@@ -2493,23 +2493,24 @@ class CheckFlatSpends(AnalyzeBase):
         translation.read(dctc.filename_tran_config)
         translation_df = translation.get()
         aly_dicts = aly_dict.to_dict(orient='records')
-        tdf = pd.DataFrame(columns=translation_df.columns)
+        rows = []
         for aly_dict in aly_dicts:
             if aly_dict[self.error_col] == self.placement_date_error:
                 old_val = aly_dict[dctc.PD].replace('00:00:00', '').strip()
                 new_val = aly_dict[
                     self.first_click_col].replace('00:00:00', '').strip()
-                trans = [{dctc.DICT_COL_NAME: dctc.PD,
-                          dctc.DICT_COL_VALUE: old_val,
-                          dctc.DICT_COL_NVALUE: new_val,
-                          dctc.DICT_COL_FNC: 'Select::' + dctc.PN,
-                          dctc.DICT_COL_SEL: aly_dict[dctc.PN]}]
-                row = pd.DataFrame(trans).reindex(
-                    columns=translation_df.columns).fillna('')
-                tdf = pd.concat([tdf, row], ignore_index=True)
-        translation_df = pd.concat([translation_df, tdf], ignore_index=True)
+                rows.append({dctc.DICT_COL_NAME: dctc.PD,
+                             dctc.DICT_COL_VALUE: old_val,
+                             dctc.DICT_COL_NVALUE: new_val,
+                             dctc.DICT_COL_FNC: 'Select::' + dctc.PN,
+                             dctc.DICT_COL_SEL: aly_dict[dctc.PN]})
+        df_cols = [dctc.DICT_COL_NAME, dctc.DICT_COL_VALUE,
+                   dctc.DICT_COL_NVALUE, dctc.DICT_COL_FNC,
+                   dctc.DICT_COL_SEL]
+        df_cols += [x for x in translation_df.columns if x not in df_cols]
+        tdf = pd.DataFrame(rows).reindex(columns=df_cols).fillna('')
         if write:
-            translation.write(translation_df, dctc.filename_tran_config)
+            translation.add_and_write(tdf)
             self.aly.fixes_to_run = True
         return tdf
 
